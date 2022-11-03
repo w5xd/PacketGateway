@@ -92,7 +92,7 @@ void setup()
         radio.encrypt(key);
 
     Serial.begin(9600);
-    Serial.print(F("Gateway V2 "));
+    Serial.print(F("Gateway V3 "));
     Serial.print("Node ");
     Serial.print(AM_GATEWAY_NODEID, DEC);
     Serial.print(" on network ");
@@ -183,6 +183,11 @@ static bool processHostCommand(const char *pHost, unsigned short count)
                 // the given id is currently in the queue
                 if (!QueueManager::empty())
                 {
+                    // At most one waiting-to-forward message will be put back into queue
+                    unsigned char TxNodeId = 0;
+                    unsigned char RadioMessageBuffer[RFM69_FRAME_LIMIT];
+                    unsigned char len = 0;
+
                     QueueEntry qe = QueueManager::first();
                     for (;;)
                     {
@@ -190,6 +195,10 @@ static bool processHostCommand(const char *pHost, unsigned short count)
                         {
                             found = true;
                             break;
+                        } else if (qe.isTx() && qe.isWaiting() && TxNodeId == 0)
+                        {   // forward-to-node message that will be deleted. Save most recent one
+                            TxNodeId = qe.NodeId();
+                            len = qe.CopyMessage(RadioMessageBuffer, RFM69_FRAME_LIMIT);
                         } else if (qe.AmLast())
                         {
                             found = false;
@@ -198,14 +207,19 @@ static bool processHostCommand(const char *pHost, unsigned short count)
                         qe = QueueManager::next(qe);
                     }
 
-                    if (found) while (!QueueManager::empty() )
-                    {       
-                        QueueEntry qe = QueueManager::first();
-                        unsigned char id = qe.MessageId();
-                        QueueManager::pop();
-                        deleted += 1;
-                        if (id == deleteId)
-                            break;
+                    if (found) 
+                    {
+                        while (!QueueManager::empty() )
+                        {       
+                            QueueEntry qe = QueueManager::first();
+                            unsigned char id = qe.MessageId();
+                            QueueManager::pop();
+                            deleted += 1;
+                            if (id == deleteId)
+                                break;
+                        }
+                        if (TxNodeId > AM_GATEWAY_NODEID) // put forward-to-node back. but just one
+                            QueueManager::push(TxNodeId, true, (const unsigned char*)RadioMessageBuffer, len);
                     }
                 }
             }
