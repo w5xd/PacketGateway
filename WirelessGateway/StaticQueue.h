@@ -2,6 +2,9 @@
 #ifndef STATIC_QUEUE_BYTE_LENGTH
 #define STATIC_QUEUE_BYTE_LENGTH 1024 // on a UNO, this is half available RAM
 #endif
+#ifndef MESSAGE_ID_TYPE
+#define MESSAGE_ID_TYPE uint8_t
+#endif
 
 /*
 * Some classes to manage a static queue.
@@ -19,12 +22,13 @@
 
 namespace StaticQueue
 {
+    typedef MESSAGE_ID_TYPE MessageIdType_t;
     const size_t QUEUE_BYTE_LENGTH = STATIC_QUEUE_BYTE_LENGTH;
 
     unsigned char QueueContents[QUEUE_BYTE_LENGTH]; // memory holding the queue
     unsigned short IndexOfFirstEntry; // in bytes
     unsigned short IndexBeyondLastEntry;	// in bytes
-    unsigned char MessageIdCounter;	// repeats every 256 push's
+    MessageIdType_t MessageIdCounter = 0;	// repeats every 256 push's on MessageIdType_t single byte
 
     /*
     * QueueEntry is the interface to a single entry in the queue
@@ -44,7 +48,15 @@ namespace StaticQueue
 
         unsigned char MessageLength() const { return QueueContents[modIdx(m_idx + MESSAGE_LEN_IDX)]; }
         unsigned char NodeId() const { return QueueContents[modIdx(m_idx + NODEID_IDX)]; }
-        unsigned char MessageId() const {return QueueContents[modIdx(m_idx + MESSAGE_ID_IDX)]; }
+        MessageIdType_t MessageId() const {
+            MessageIdType_t id(0);
+            for (uint8_t i = 0; i < sizeof(MessageIdType_t); i++)
+            {
+                id <<= 8;
+                id += QueueContents[modIdx(m_idx + MESSAGE_ID_IDX + sizeof(MessageIdType_t) - 1 - i)];
+            }
+            return id; 
+        }
 
 #if !defined(STATIC_QUEUE_OMIT_SERIAL)
         void SerialPrint() const
@@ -118,7 +130,7 @@ namespace StaticQueue
 
     private:
         friend class QueueManager;
-        enum { MESSAGE_LEN_IDX, MESSAGE_ID_IDX, NODEID_IDX, STATUS_IDX, RSS_HIGH_IDX, RSS_LOW_IDX, TIME_HIGH_IDX, TIME_LOW_IDX,
+        enum { MESSAGE_LEN_IDX, MESSAGE_ID_IDX, NODEID_IDX = MESSAGE_ID_IDX + sizeof(MessageIdType_t), STATUS_IDX, RSS_HIGH_IDX, RSS_LOW_IDX, TIME_HIGH_IDX, TIME_LOW_IDX,
             QUEUE_ENTRY_LENGTH};
 
         // field definitions
@@ -142,7 +154,12 @@ namespace StaticQueue
             QueueContents[modIdx(m_idx + NODEID_IDX)] = NodeId;
             QueueContents[modIdx(m_idx + MESSAGE_LEN_IDX)] = len;
             QueueContents[modIdx(m_idx + STATUS_IDX)] = isTx ? InitTxStatus() : InitRxStatus();
-            QueueContents[modIdx(m_idx + MESSAGE_ID_IDX)] = MessageIdCounter++;
+            auto ThisMsgId = MessageIdCounter++;
+            for (uint8_t i = 0; i < sizeof(MessageIdType_t); i++)
+            {
+                QueueContents[modIdx(m_idx + MESSAGE_ID_IDX + i)] = ThisMsgId & 0xffu;
+                ThisMsgId >>= 8;
+            }
             return modIdx(m_idx + QUEUE_ENTRY_LENGTH);
         }
 

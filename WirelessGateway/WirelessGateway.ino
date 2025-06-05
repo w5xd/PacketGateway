@@ -2,6 +2,24 @@
 #include <SPI.h>
 #include <RadioConfiguration.h>
 
+
+#define VERSION_ID_STR "Gateway V4"
+
+// For a default wiring configuration, define USE_DEFAULT_CPU_ASSIGNMENTS 1
+// Otherwise, spell out the arguments to the RFM69 constructor
+#define USE_DEFAULT_CPU_ASSIGNMENTS 0
+#define USE_TEENSY_ASSIGNMENTS 1 
+
+#if USE_DEFAULT_CPU_ASSIGNMENTS == 0
+#if USE_TEENSY_ASSIGNMENTS > 0
+const int RFM69_NSS_PIN = 8;
+const int RFM69_INT_PIN = 9;
+#define STATIC_QUEUE_BYTE_LENGTH 0x8000
+#define MESSAGE_ID_TYPE uint16_t
+#endif
+#endif
+
+
 #include "StaticQueue.h"
 using namespace StaticQueue;
 
@@ -73,37 +91,92 @@ enum {
     HOST_BUFFER_LENGTH = RFM69_FRAME_LIMIT + LONGEST_COMMAND_NAME + CHAR_IN_NODEID + NUMBER_OF_SPACES_AND_CR
 };
 
+static uint16_t Startup_delay_msec;
+
+enum class EepromAddresses {GATEWAY_START = (~0x7u & (7 + RadioConfiguration::EepromAddresses::TOTAL_EEPROM_USED)),
+       STARTUP_DELAY_MSEC = GATEWAY_START,
+        TOTAL_EEPROM_USED = STARTUP_DELAY_MSEC + sizeof(Startup_delay_msec),
+    };
+
 // Create a library object for our RFM69HCW module:
+#if USE_DEFAULT_CPU_ASSIGNMENTS > 0
 RFM69 radio;
+#elif USE_TEENSY_ASSIGNMENTS > 0
+class RFM69delayCanSend : public RFM69
+{
+    public:
+        RFM69delayCanSend(int nss, int irq) : RFM69(nss, irq, true)
+        {}
+        
+        bool canSend() override 
+        {       
+            /* this delay(1) is inspired by the  #ifdef ESP8266 in the library code
+                https://github.com/LowPowerLab/RFM69
+            */
+            auto ret = RFM69::canSend();
+            if (!ret)
+                delay(1);
+            return ret;
+        }
+};
+RFM69delayCanSend radio(RFM69_NSS_PIN,RFM69_INT_PIN);
+#endif
 RadioConfiguration radioConfiguration;
 static const int AM_GATEWAY_NODEID = 1;   // My node ID
+static    bool radioOK = false;
 
 void setup()
 {
-    // Initialize the RFM69HCW:
-    radio.initialize(
-        radioConfiguration.FrequencyBandId(),
-        AM_GATEWAY_NODEID,	// we're the gateway. we use a non-programmable nodeId
-        radioConfiguration.NetworkId());
+    EEPROM.get(static_cast<uint16_t>(EepromAddresses::STARTUP_DELAY_MSEC), Startup_delay_msec);
+    if (Startup_delay_msec == 0xFFFF)
+        Startup_delay_msec = 0;
+    delay(Startup_delay_msec);
 
-    radio.setHighPower(); // Always use this for RFM69HCW
-    const char *key = radioConfiguration.EncryptionKey();
-    if (radioConfiguration.encrypted())
-        radio.encrypt(key);
+    uint16_t nodeId = AM_GATEWAY_NODEID;
+    // Initialize the RFM69HCW:
+    if (radioConfiguration.NetworkId() != 0xff)
+    {
+        auto EepromNodeId = radioConfiguration.NodeId();
+        if (EepromNodeId != 0xff)
+            nodeId = EepromNodeId;
+        radioOK = radio.initialize(radioConfiguration.FrequencyBandId(),
+            nodeId, radioConfiguration.NetworkId());
+        if (radioOK)
+        {
+            uint32_t freq;
+            if (radioConfiguration.FrequencyKHz(freq))
+                radio.setFrequency(freq*1000);
+            radio.spyMode(true);
+            radioOK = radio.getFrequency() != 0;
+            if (radioOK)
+            {
+                radio.setHighPower(); // Always use this for RFM69HCW
+                const char *key = radioConfiguration.EncryptionKey();
+                if (radioConfiguration.encrypted())
+                    radio.encrypt(key);
+            }
+        }
+    }
 
     Serial.begin(9600);
-    Serial.print(F("Gateway V3 "));
-    Serial.print("Node ");
-    Serial.print(AM_GATEWAY_NODEID, DEC);
-    Serial.print(" on network ");
-    Serial.print(radioConfiguration.NetworkId(), DEC);
-    Serial.print(" band ");
-    Serial.print(radioConfiguration.FrequencyBandId(), DEC);
-    Serial.print(" key ");
-    radioConfiguration.printEncryptionKey(Serial);
-    Serial.println();
-    Serial.print("Freq= "); Serial.print(radio.getFrequency() / 1000);
-    Serial.println(" KHz");
+    Serial.print(F(VERSION_ID_STR));
+    if (radioOK)
+    {
+        Serial.print(" Node ");
+        Serial.print(nodeId, DEC);
+        Serial.print(" on network ");
+        Serial.print(radioConfiguration.NetworkId(), DEC);
+        Serial.print(" band ");
+        Serial.print(radioConfiguration.FrequencyBandId(), DEC);
+        Serial.print(" key ");
+        radioConfiguration.printEncryptionKey(Serial);
+        Serial.println();
+        Serial.print("Freq= "); Serial.print(radio.getFrequency() / 1000);
+        Serial.println(" KHz");
+    }
+    else
+        Serial.println(F("Radio not initialized"));
+    Serial.print(F("StartupDelayMsec=")); Serial.println(Startup_delay_msec);
     Serial.println(F(" ready"));
 }
 
@@ -113,6 +186,7 @@ static bool processHostCommand(const char *pHost, unsigned short count)
     static const char DELETEMESSAGES[] = "DeleteMessagesFromId";
     static const char FORWARDMESSAGETONODE[] = "ForwardMessageToNode";
     static const char SENDMESSAGETONODE[] = "SendMessageToNode";
+    static const char SETSTARTUPDELAYMSEC[] = "SetStartupDelayMsec";
 
     if (strncmp(pHost, GETMESSAGES, sizeof(GETMESSAGES) - 1) == 0)
     {	// print the message queue
@@ -212,7 +286,7 @@ static bool processHostCommand(const char *pHost, unsigned short count)
                         while (!QueueManager::empty() )
                         {       
                             QueueEntry qe = QueueManager::first();
-                            unsigned char id = qe.MessageId();
+                            auto id = qe.MessageId();
                             QueueManager::pop();
                             deleted += 1;
                             if (id == deleteId)
@@ -286,6 +360,12 @@ static bool processHostCommand(const char *pHost, unsigned short count)
             }
         }
     }
+    else if (strncmp(pHost, SETSTARTUPDELAYMSEC, sizeof(SETSTARTUPDELAYMSEC) - 1) == 0)
+    {
+        pHost += sizeof(SETSTARTUPDELAYMSEC);
+        Startup_delay_msec = atoi(pHost);
+        EEPROM.put(static_cast<uint16_t>(EepromAddresses::STARTUP_DELAY_MSEC), Startup_delay_msec);
+    }
     else
         return false;
     return true;
@@ -329,7 +409,7 @@ void loop()
     // In this section, we'll check with the RFM69HCW to see
     // if it has received any packets:
 
-    if (radio.receiveDone()) // Got a packet over the radio
+    if (radioOK && radio.receiveDone()) // Got a packet over the radio
     {
         // make room to store the incoming packet
         while (!QueueManager::isRoomFor(radio.DATALEN))
@@ -342,7 +422,7 @@ void loop()
 
         if (radio.ACKRequested())
             radio.sendACK();
-
+ 
         if (!QueueManager::empty())
         {	// on receipt of a packet search queue for ForwardMessageToNode items
             QueueEntry qe = QueueManager::first();
